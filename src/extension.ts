@@ -30,7 +30,7 @@ async function testConnection(authManager: MiniMaxAuthentication): Promise<void>
 
   try {
     const stream = client.streamChat(
-      "MiniMax-M2.5",
+      "MiniMax-M2.7",
       [{ role: "user", content: "Ping" }],
       {
         apiKey: key,

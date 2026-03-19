@@ -55,26 +55,24 @@ export interface MiniMaxToolDefinition {
   };
 }
 
-export const MODEL_IDS = [
+const MODEL_IDS = [
+  "MiniMax-M2.7",
   "MiniMax-M2.5",
-  "MiniMax-M2.1",
-  "MiniMax-M2",
 ] as const;
 
-export type ModelId = (typeof MODEL_IDS)[number];
+type ModelId = (typeof MODEL_IDS)[number];
 
-export interface ModelInfo {
+interface ModelInfo {
   id: ModelId;
   name: string;
   contextLength: number;
 }
 
-export const DEFAULT_MODEL_ID: ModelId = "MiniMax-M2.5";
+const DEFAULT_MODEL_ID: ModelId = "MiniMax-M2.7";
 
 export const SUPPORTED_MODELS: readonly ModelInfo[] = [
+  { id: "MiniMax-M2.7", name: "MiniMax M2.7", contextLength: 204800 },
   { id: "MiniMax-M2.5", name: "MiniMax M2.5", contextLength: 204800 },
-  { id: "MiniMax-M2.1", name: "MiniMax M2.1", contextLength: 204800 },
-  { id: "MiniMax-M2", name: "MiniMax M2", contextLength: 204800 },
 ];
 
 const MODEL_BY_ID: Readonly<Record<ModelId, ModelInfo>> = Object.fromEntries(
