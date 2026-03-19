@@ -49,7 +49,22 @@ class ThinkingBlockParser {
   private inThinkingBlock = false;
   private buffer = "";
 
+  private static readonly START_TAG = "<think>";
+  private static readonly END_TAG = "</think>";
+  private static readonly MAX_TAG_LENGTH = ThinkingBlockParser.END_TAG.length;
+
   parse(text: string): { regular: string; thinking: string; sawThinkingMarkup: boolean } {
+    return this.parseChunk(text, false);
+  }
+
+  flush(): { regular: string; thinking: string; sawThinkingMarkup: boolean } {
+    return this.parseChunk("", true);
+  }
+
+  private parseChunk(
+    text: string,
+    flushTrailingPartialTag: boolean,
+  ): { regular: string; thinking: string; sawThinkingMarkup: boolean } {
     let regular = "";
     let thinking = "";
     let sawThinkingMarkup = false;
@@ -57,33 +72,70 @@ class ThinkingBlockParser {
 
     while (true) {
       if (this.inThinkingBlock) {
-        const endIdx = this.buffer.indexOf("</think>");
+        const endIdx = this.buffer.indexOf(ThinkingBlockParser.END_TAG);
         if (endIdx !== -1) {
           thinking += this.buffer.substring(0, endIdx);
-          this.buffer = this.buffer.substring(endIdx + 8);
+          this.buffer = this.buffer.substring(endIdx + ThinkingBlockParser.END_TAG.length);
           this.inThinkingBlock = false;
           sawThinkingMarkup = true;
         } else {
-          thinking += this.buffer;
-          this.buffer = "";
+          const retained = this.splitTrailingPartialTag(
+            this.buffer,
+            ThinkingBlockParser.END_TAG,
+            flushTrailingPartialTag,
+          );
+          thinking += retained.flushed;
+          this.buffer = retained.remaining;
           break;
         }
       } else {
-        const startIdx = this.buffer.indexOf("<think>");
+        const startIdx = this.buffer.indexOf(ThinkingBlockParser.START_TAG);
         if (startIdx !== -1) {
           regular += this.buffer.substring(0, startIdx);
-          this.buffer = this.buffer.substring(startIdx + 7);
+          this.buffer = this.buffer.substring(startIdx + ThinkingBlockParser.START_TAG.length);
           this.inThinkingBlock = true;
           sawThinkingMarkup = true;
         } else {
-          regular += this.buffer;
-          this.buffer = "";
+          const retained = this.splitTrailingPartialTag(
+            this.buffer,
+            ThinkingBlockParser.START_TAG,
+            flushTrailingPartialTag,
+          );
+          regular += retained.flushed;
+          this.buffer = retained.remaining;
           break;
         }
       }
     }
 
     return { regular, thinking, sawThinkingMarkup };
+  }
+
+  private splitTrailingPartialTag(
+    buffer: string,
+    tag: string,
+    flushTrailingPartialTag: boolean,
+  ): { flushed: string; remaining: string } {
+    if (buffer.length === 0) {
+      return { flushed: "", remaining: "" };
+    }
+
+    if (flushTrailingPartialTag) {
+      return { flushed: buffer, remaining: "" };
+    }
+
+    const maxLen = Math.min(ThinkingBlockParser.MAX_TAG_LENGTH - 1, buffer.length, tag.length - 1);
+    for (let len = maxLen; len >= 1; len--) {
+      const suffix = buffer.substring(buffer.length - len);
+      if (tag.startsWith(suffix)) {
+        return {
+          flushed: buffer.substring(0, buffer.length - len),
+          remaining: suffix,
+        };
+      }
+    }
+
+    return { flushed: buffer, remaining: "" };
   }
 
   get isInsideThinkingBlock(): boolean {
@@ -205,15 +257,18 @@ export class MiniMaxProvider implements vscode.LanguageModelChatProvider {
           }
 
           if (parsed.thinking.length > 0) {
-            currentThinkingId ??= `minimax_thinking_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-            this.reportReasoning(
+            const thinkingId = currentThinkingId ?? `minimax_thinking_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+            const reportedThinking = this.reportReasoning(
               progress,
               thinkingPartCtor,
               parsed.thinking,
-              { text: parsed.thinking, id: currentThinkingId },
+              { text: parsed.thinking, id: thinkingId },
               thinkingChunkEmitted,
             );
-            thinkingChunkEmitted = true;
+            if (reportedThinking) {
+              currentThinkingId = thinkingId;
+              thinkingChunkEmitted = true;
+            }
           }
 
           if (parsed.regular.length > 0) {
@@ -234,9 +289,15 @@ export class MiniMaxProvider implements vscode.LanguageModelChatProvider {
               : latestReasoning.text;
 
             if (newReasoning) {
-              this.reportReasoning(progress, thinkingPartCtor, newReasoning, latestReasoning, thinkingChunkEmitted);
+              const reportedThinking = this.reportReasoning(
+                progress,
+                thinkingPartCtor,
+                newReasoning,
+                latestReasoning,
+                thinkingChunkEmitted,
+              );
               reasoningBuffer = latestReasoning.text;
-              thinkingChunkEmitted = true;
+              thinkingChunkEmitted ||= reportedThinking;
             }
           }
         }
@@ -249,14 +310,23 @@ export class MiniMaxProvider implements vscode.LanguageModelChatProvider {
       }
     }
 
-    const flushed = thinkingParser.parse("");
+    const flushed = thinkingParser.flush();
     if (flushed.thinking.length > 0) {
-      currentThinkingId ??= `minimax_thinking_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-      this.reportReasoning(progress, thinkingPartCtor, flushed.thinking, {
-        text: flushed.thinking,
-        id: currentThinkingId,
-      }, thinkingChunkEmitted);
-      thinkingChunkEmitted = true;
+      const thinkingId = currentThinkingId ?? `minimax_thinking_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const reportedThinking = this.reportReasoning(
+        progress,
+        thinkingPartCtor,
+        flushed.thinking,
+        {
+          text: flushed.thinking,
+          id: thinkingId,
+        },
+        thinkingChunkEmitted,
+      );
+      if (reportedThinking) {
+        currentThinkingId = thinkingId;
+        thinkingChunkEmitted = true;
+      }
     }
     if (flushed.regular.length > 0) {
       if (currentThinkingId) {
@@ -616,8 +686,11 @@ export class MiniMaxProvider implements vscode.LanguageModelChatProvider {
     text: string,
     reasoning: ReasoningUpdate,
     thinkingChunkEmitted: boolean,
-  ): void {
+  ): boolean {
     const normalizedText = this.normalizeReasoningText(text);
+    if (normalizedText.length === 0) {
+      return false;
+    }
 
     if (!thinkingPartCtor) {
       // When the proposed ThinkingPart API is not available (stable VS Code), fall back to
@@ -625,13 +698,14 @@ export class MiniMaxProvider implements vscode.LanguageModelChatProvider {
       // Only prefix with thinking marker on first chunk to avoid repetition.
       const prefix = thinkingChunkEmitted ? "" : "\n\n🤔 ";
       progress.report(new vscode.LanguageModelTextPart(`${prefix}${normalizedText}`));
-      return;
+      return true;
     }
 
     const thinkingPart = new thinkingPartCtor(normalizedText, reasoning.id, reasoning.metadata);
     (progress as vscode.Progress<vscode.LanguageModelResponsePart | unknown>).report(
       thinkingPart as vscode.LanguageModelResponsePart,
     );
+    return true;
   }
 
   private endThinking(
@@ -652,9 +726,8 @@ export class MiniMaxProvider implements vscode.LanguageModelChatProvider {
   private normalizeReasoningText(text: string): string {
     // Some models return thinking blocks as raw <think>...</think> tags. Strip those
     // so they don't render as XML in the chat UI.
-    const trimmed = text.trim();
-    const stripped = trimmed.replace(/<\/?think>/gi, "");
-    return stripped.trim();
+    const stripped = text.replace(/<\/?think>/gi, "");
+    return stripped.trim().length === 0 ? "" : stripped;
   }
 
   private getThinkingPartCtor(): ThinkingPartCtor | undefined {
