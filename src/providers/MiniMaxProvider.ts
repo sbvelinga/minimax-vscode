@@ -169,6 +169,7 @@ export class MiniMaxProvider implements vscode.LanguageModelChatProvider {
     const thinkingParser = new ThinkingBlockParser();
     let inlineThinkingDetected = false;
     let currentThinkingId: string | undefined;
+    let thinkingChunkEmitted = false;
     // Always request reasoning split from the API so we can render thinking blocks,
     // even if the current VS Code version doesn't support LanguageModelThinkingPart.
     const useReasoningSplit = true;
@@ -210,13 +211,16 @@ export class MiniMaxProvider implements vscode.LanguageModelChatProvider {
               thinkingPartCtor,
               parsed.thinking,
               { text: parsed.thinking, id: currentThinkingId },
+              thinkingChunkEmitted,
             );
+            thinkingChunkEmitted = true;
           }
 
           if (parsed.regular.length > 0) {
             if (currentThinkingId) {
               this.endThinking(progress, thinkingPartCtor, currentThinkingId);
               currentThinkingId = undefined;
+              thinkingChunkEmitted = false;
             }
             progress.report(new vscode.LanguageModelTextPart(parsed.regular));
           }
@@ -230,8 +234,9 @@ export class MiniMaxProvider implements vscode.LanguageModelChatProvider {
               : latestReasoning.text;
 
             if (newReasoning) {
-              this.reportReasoning(progress, thinkingPartCtor, newReasoning, latestReasoning);
+              this.reportReasoning(progress, thinkingPartCtor, newReasoning, latestReasoning, thinkingChunkEmitted);
               reasoningBuffer = latestReasoning.text;
+              thinkingChunkEmitted = true;
             }
           }
         }
@@ -250,17 +255,20 @@ export class MiniMaxProvider implements vscode.LanguageModelChatProvider {
       this.reportReasoning(progress, thinkingPartCtor, flushed.thinking, {
         text: flushed.thinking,
         id: currentThinkingId,
-      });
+      }, thinkingChunkEmitted);
+      thinkingChunkEmitted = true;
     }
     if (flushed.regular.length > 0) {
       if (currentThinkingId) {
         this.endThinking(progress, thinkingPartCtor, currentThinkingId);
         currentThinkingId = undefined;
+        thinkingChunkEmitted = false;
       }
       progress.report(new vscode.LanguageModelTextPart(flushed.regular));
     }
     if (currentThinkingId) {
       this.endThinking(progress, thinkingPartCtor, currentThinkingId);
+      thinkingChunkEmitted = false;
     }
   }
 
@@ -607,13 +615,16 @@ export class MiniMaxProvider implements vscode.LanguageModelChatProvider {
     thinkingPartCtor: ThinkingPartCtor | undefined,
     text: string,
     reasoning: ReasoningUpdate,
+    thinkingChunkEmitted: boolean,
   ): void {
     const normalizedText = this.normalizeReasoningText(text);
 
     if (!thinkingPartCtor) {
       // When the proposed ThinkingPart API is not available (stable VS Code), fall back to
       // displaying reasoning inline with the response in a readable way.
-      progress.report(new vscode.LanguageModelTextPart(`\n\n🤔 ${normalizedText}`));
+      // Only prefix with thinking marker on first chunk to avoid repetition.
+      const prefix = thinkingChunkEmitted ? "" : "\n\n🤔 ";
+      progress.report(new vscode.LanguageModelTextPart(`${prefix}${normalizedText}`));
       return;
     }
 
