@@ -45,6 +45,52 @@ interface AccumulatedToolCall {
   arguments: string;
 }
 
+class ThinkingBlockParser {
+  private inThinkingBlock = false;
+  private buffer = "";
+
+  parse(text: string): { regular: string; thinking: string; sawThinkingMarkup: boolean } {
+    let regular = "";
+    let thinking = "";
+    let sawThinkingMarkup = false;
+    this.buffer += text;
+
+    while (true) {
+      if (this.inThinkingBlock) {
+        const endIdx = this.buffer.indexOf("</think>");
+        if (endIdx !== -1) {
+          thinking += this.buffer.substring(0, endIdx);
+          this.buffer = this.buffer.substring(endIdx + 8);
+          this.inThinkingBlock = false;
+          sawThinkingMarkup = true;
+        } else {
+          thinking += this.buffer;
+          this.buffer = "";
+          break;
+        }
+      } else {
+        const startIdx = this.buffer.indexOf("<think>");
+        if (startIdx !== -1) {
+          regular += this.buffer.substring(0, startIdx);
+          this.buffer = this.buffer.substring(startIdx + 7);
+          this.inThinkingBlock = true;
+          sawThinkingMarkup = true;
+        } else {
+          regular += this.buffer;
+          this.buffer = "";
+          break;
+        }
+      }
+    }
+
+    return { regular, thinking, sawThinkingMarkup };
+  }
+
+  get isInsideThinkingBlock(): boolean {
+    return this.inThinkingBlock;
+  }
+}
+
 export class MiniMaxProvider implements vscode.LanguageModelChatProvider {
   private readonly modelsChangedEmitter = new vscode.EventEmitter<void>();
   readonly onDidChangeLanguageModelChatInformation = this.modelsChangedEmitter.event;
@@ -120,7 +166,12 @@ export class MiniMaxProvider implements vscode.LanguageModelChatProvider {
 
     let reasoningBuffer = "";
     const thinkingPartCtor = this.getThinkingPartCtor();
-    const useReasoningSplit = Boolean(thinkingPartCtor);
+    const thinkingParser = new ThinkingBlockParser();
+    let inlineThinkingDetected = false;
+    let currentThinkingId: string | undefined;
+    // Always request reasoning split from the API so we can render thinking blocks,
+    // even if the current VS Code version doesn't support LanguageModelThinkingPart.
+    const useReasoningSplit = true;
     const pendingToolCalls = new Map<number, AccumulatedToolCall>();
     let toolCallsEmitted = false;
     const tools = this.convertTools(options.tools);
@@ -145,7 +196,33 @@ export class MiniMaxProvider implements vscode.LanguageModelChatProvider {
       }
 
       for (const choice of chunk.choices) {
-        if (thinkingPartCtor) {
+        const content = choice.delta?.content;
+        if (typeof content === "string" && content.length > 0) {
+          const parsed = thinkingParser.parse(content);
+          if (parsed.sawThinkingMarkup || thinkingParser.isInsideThinkingBlock) {
+            inlineThinkingDetected = true;
+          }
+
+          if (parsed.thinking.length > 0) {
+            currentThinkingId ??= `minimax_thinking_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+            this.reportReasoning(
+              progress,
+              thinkingPartCtor,
+              parsed.thinking,
+              { text: parsed.thinking, id: currentThinkingId },
+            );
+          }
+
+          if (parsed.regular.length > 0) {
+            if (currentThinkingId) {
+              this.endThinking(progress, thinkingPartCtor, currentThinkingId);
+              currentThinkingId = undefined;
+            }
+            progress.report(new vscode.LanguageModelTextPart(parsed.regular));
+          }
+        }
+
+        if (!inlineThinkingDetected) {
           const latestReasoning = this.getLatestReasoningUpdate(choice);
           if (latestReasoning) {
             const newReasoning = latestReasoning.text.startsWith(reasoningBuffer)
@@ -159,17 +236,31 @@ export class MiniMaxProvider implements vscode.LanguageModelChatProvider {
           }
         }
 
-        const content = choice.delta?.content;
-        if (content) {
-          progress.report(new vscode.LanguageModelTextPart(content));
-        }
-
         this.accumulateToolCalls(choice, pendingToolCalls);
         if (!toolCallsEmitted && this.isToolCallFinish(choice)) {
           this.reportToolCalls(progress, pendingToolCalls);
           toolCallsEmitted = true;
         }
       }
+    }
+
+    const flushed = thinkingParser.parse("");
+    if (flushed.thinking.length > 0) {
+      currentThinkingId ??= `minimax_thinking_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      this.reportReasoning(progress, thinkingPartCtor, flushed.thinking, {
+        text: flushed.thinking,
+        id: currentThinkingId,
+      });
+    }
+    if (flushed.regular.length > 0) {
+      if (currentThinkingId) {
+        this.endThinking(progress, thinkingPartCtor, currentThinkingId);
+        currentThinkingId = undefined;
+      }
+      progress.report(new vscode.LanguageModelTextPart(flushed.regular));
+    }
+    if (currentThinkingId) {
+      this.endThinking(progress, thinkingPartCtor, currentThinkingId);
     }
   }
 
@@ -517,15 +608,42 @@ export class MiniMaxProvider implements vscode.LanguageModelChatProvider {
     text: string,
     reasoning: ReasoningUpdate,
   ): void {
+    const normalizedText = this.normalizeReasoningText(text);
+
     if (!thinkingPartCtor) {
-      progress.report(new vscode.LanguageModelTextPart(`<think>${text}</think>`));
+      // When the proposed ThinkingPart API is not available (stable VS Code), fall back to
+      // displaying reasoning inline with the response in a readable way.
+      progress.report(new vscode.LanguageModelTextPart(`\n\n🤔 ${normalizedText}`));
       return;
     }
 
-    const thinkingPart = new thinkingPartCtor(text, reasoning.id, reasoning.metadata);
+    const thinkingPart = new thinkingPartCtor(normalizedText, reasoning.id, reasoning.metadata);
     (progress as vscode.Progress<vscode.LanguageModelResponsePart | unknown>).report(
       thinkingPart as vscode.LanguageModelResponsePart,
     );
+  }
+
+  private endThinking(
+    progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+    thinkingPartCtor: ThinkingPartCtor | undefined,
+    thinkingId: string,
+  ): void {
+    if (!thinkingPartCtor) {
+      return;
+    }
+
+    const thinkingPart = new thinkingPartCtor("", thinkingId);
+    (progress as vscode.Progress<vscode.LanguageModelResponsePart | unknown>).report(
+      thinkingPart as vscode.LanguageModelResponsePart,
+    );
+  }
+
+  private normalizeReasoningText(text: string): string {
+    // Some models return thinking blocks as raw <think>...</think> tags. Strip those
+    // so they don't render as XML in the chat UI.
+    const trimmed = text.trim();
+    const stripped = trimmed.replace(/<\/?think>/gi, "");
+    return stripped.trim();
   }
 
   private getThinkingPartCtor(): ThinkingPartCtor | undefined {
